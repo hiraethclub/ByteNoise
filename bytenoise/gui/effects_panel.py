@@ -1,20 +1,21 @@
 """Effects chain controls panel.
 
 Each effect has a collapsible group containing:
-    * an "enabled" checkbox
+    * an "enabled" checkbox (the QGroupBox itself is checkable)
     * its parameter sliders
     * a wet/dry mix slider where applicable
 
-The panel emits ``parameters_changed`` whenever any control updates.
+The panel emits ``parameters_changed`` whenever any control updates and
+exposes ``refresh()`` so undo/redo and randomise can push state back into the
+controls without firing change signals.
 """
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, List, Tuple
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QCheckBox,
     QGridLayout,
     QGroupBox,
     QLabel,
@@ -27,22 +28,8 @@ from PyQt5.QtWidgets import (
 from ..engine.effects import EffectsChain
 
 
-def _make_slider(
-    minimum: int,
-    maximum: int,
-    initial: int,
-    on_change: Callable[[int], None],
-) -> QSlider:
-    slider = QSlider(Qt.Horizontal)
-    slider.setMinimum(minimum)
-    slider.setMaximum(maximum)
-    slider.setValue(initial)
-    slider.valueChanged.connect(on_change)
-    return slider
-
-
 class _ParamRow(QWidget):
-    """A row containing a name label, a value label, and a slider."""
+    """Slider row with name + value labels and a silent ``set_value()``."""
 
     def __init__(
         self,
@@ -66,12 +53,22 @@ class _ParamRow(QWidget):
         self.value_label.setMinimumWidth(80)
         layout.addWidget(self.value_label, 0, 1)
 
-        self.slider = _make_slider(minimum, maximum, initial, self._handle)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(minimum)
+        self.slider.setMaximum(maximum)
+        self.slider.setValue(initial)
+        self.slider.valueChanged.connect(self._handle)
         layout.addWidget(self.slider, 1, 0, 1, 2)
 
     def _handle(self, value: int) -> None:
         self.value_label.setText(self._formatter(value))
         self._on_change(value)
+
+    def set_value(self, value: int) -> None:
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(value))
+        self.slider.blockSignals(False)
+        self.value_label.setText(self._formatter(int(value)))
 
 
 class EffectsPanel(QWidget):
@@ -83,6 +80,10 @@ class EffectsPanel(QWidget):
         super().__init__()
         self.effects = effects
 
+        # Refreshable widget registries.
+        self._sliders: List[Tuple[_ParamRow, Callable[[], int]]] = []
+        self._groups: List[Tuple[QGroupBox, Callable[[], bool]]] = []
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
@@ -90,7 +91,6 @@ class EffectsPanel(QWidget):
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
         outer.addWidget(title)
 
-        # Use a scroll area so the panel still fits on smaller screens.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         outer.addWidget(scroll)
@@ -109,192 +109,233 @@ class EffectsPanel(QWidget):
         layout.addStretch()
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _add_slider(
+        self,
+        layout,
+        name: str,
+        minimum: int,
+        maximum: int,
+        getter: Callable[[], int],
+        setter: Callable[[int], None],
+        formatter: Callable[[int], str],
+    ) -> _ParamRow:
+        def on_change(value: int) -> None:
+            setter(value)
+            self.parameters_changed.emit()
+
+        row = _ParamRow(name, minimum, maximum, getter(), formatter, on_change)
+        layout.addWidget(row)
+        self._sliders.append((row, getter))
+        return row
+
+    def _make_group(
+        self,
+        title: str,
+        getter: Callable[[], bool],
+        setter: Callable[[bool], None],
+    ) -> QGroupBox:
+        group = QGroupBox(title)
+        group.setCheckable(True)
+        group.setChecked(getter())
+
+        def on_toggle(checked: bool) -> None:
+            setter(bool(checked))
+            self.parameters_changed.emit()
+
+        group.toggled.connect(on_toggle)
+        self._groups.append((group, getter))
+        return group
+
+    # ------------------------------------------------------------------
     # Group builders
     # ------------------------------------------------------------------
 
-    def _make_group(self, title: str, enabled: bool, on_toggle: Callable[[bool], None]) -> QGroupBox:
-        group = QGroupBox(title)
-        group.setCheckable(True)
-        group.setChecked(enabled)
-        group.toggled.connect(on_toggle)
-        return group
-
     def _build_lowpass(self) -> QGroupBox:
         fx = self.effects.low_pass
-
-        def on_toggle(checked: bool) -> None:
-            fx.enabled = bool(checked)
-            self.parameters_changed.emit()
-
-        group = self._make_group("Low-pass filter", fx.enabled, on_toggle)
+        group = self._make_group(
+            "Low-pass filter",
+            getter=lambda: fx.enabled,
+            setter=lambda v: setattr(fx, "enabled", v),
+        )
         layout = QVBoxLayout(group)
-
-        def set_cutoff(v: int) -> None:
-            fx.cutoff = float(v)
-            self.parameters_changed.emit()
-
-        def set_res(v: int) -> None:
-            fx.resonance = v / 100.0
-            self.parameters_changed.emit()
-
-        def set_mix(v: int) -> None:
-            fx.mix = v / 100.0
-            self.parameters_changed.emit()
-
-        layout.addWidget(_ParamRow("Cutoff", 50, 18000, int(fx.cutoff),
-                                   lambda v: f"{v} Hz", set_cutoff))
-        layout.addWidget(_ParamRow("Resonance", 50, 500, int(fx.resonance * 100),
-                                   lambda v: f"{v / 100.0:.2f}", set_res))
-        layout.addWidget(_ParamRow("Mix", 0, 100, int(fx.mix * 100),
-                                   lambda v: f"{v}%", set_mix))
+        self._add_slider(
+            layout, "Cutoff", 50, 18000,
+            getter=lambda: int(fx.cutoff),
+            setter=lambda v: setattr(fx, "cutoff", float(v)),
+            formatter=lambda v: f"{v} Hz",
+        )
+        self._add_slider(
+            layout, "Resonance", 50, 500,
+            getter=lambda: int(fx.resonance * 100),
+            setter=lambda v: setattr(fx, "resonance", v / 100.0),
+            formatter=lambda v: f"{v / 100.0:.2f}",
+        )
+        self._add_slider(
+            layout, "Mix", 0, 100,
+            getter=lambda: int(fx.mix * 100),
+            setter=lambda v: setattr(fx, "mix", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
         return group
 
     def _build_highpass(self) -> QGroupBox:
         fx = self.effects.high_pass
-
-        def on_toggle(checked: bool) -> None:
-            fx.enabled = bool(checked)
-            self.parameters_changed.emit()
-
-        group = self._make_group("High-pass filter", fx.enabled, on_toggle)
+        group = self._make_group(
+            "High-pass filter",
+            getter=lambda: fx.enabled,
+            setter=lambda v: setattr(fx, "enabled", v),
+        )
         layout = QVBoxLayout(group)
-
-        def set_cutoff(v: int) -> None:
-            fx.cutoff = float(v)
-            self.parameters_changed.emit()
-
-        def set_res(v: int) -> None:
-            fx.resonance = v / 100.0
-            self.parameters_changed.emit()
-
-        def set_mix(v: int) -> None:
-            fx.mix = v / 100.0
-            self.parameters_changed.emit()
-
-        layout.addWidget(_ParamRow("Cutoff", 20, 12000, int(fx.cutoff),
-                                   lambda v: f"{v} Hz", set_cutoff))
-        layout.addWidget(_ParamRow("Resonance", 50, 500, int(fx.resonance * 100),
-                                   lambda v: f"{v / 100.0:.2f}", set_res))
-        layout.addWidget(_ParamRow("Mix", 0, 100, int(fx.mix * 100),
-                                   lambda v: f"{v}%", set_mix))
+        self._add_slider(
+            layout, "Cutoff", 20, 12000,
+            getter=lambda: int(fx.cutoff),
+            setter=lambda v: setattr(fx, "cutoff", float(v)),
+            formatter=lambda v: f"{v} Hz",
+        )
+        self._add_slider(
+            layout, "Resonance", 50, 500,
+            getter=lambda: int(fx.resonance * 100),
+            setter=lambda v: setattr(fx, "resonance", v / 100.0),
+            formatter=lambda v: f"{v / 100.0:.2f}",
+        )
+        self._add_slider(
+            layout, "Mix", 0, 100,
+            getter=lambda: int(fx.mix * 100),
+            setter=lambda v: setattr(fx, "mix", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
         return group
 
     def _build_distortion(self) -> QGroupBox:
         fx = self.effects.distortion
-
-        def on_toggle(checked: bool) -> None:
-            fx.enabled = bool(checked)
-            self.parameters_changed.emit()
-
-        group = self._make_group("Distortion / Overdrive", fx.enabled, on_toggle)
+        group = self._make_group(
+            "Distortion / Overdrive",
+            getter=lambda: fx.enabled,
+            setter=lambda v: setattr(fx, "enabled", v),
+        )
         layout = QVBoxLayout(group)
-
-        def set_drive(v: int) -> None:
-            fx.drive = float(v) / 10.0
-            self.parameters_changed.emit()
-
-        def set_tone(v: int) -> None:
-            fx.tone = v / 100.0
-            self.parameters_changed.emit()
-
-        def set_mix(v: int) -> None:
-            fx.mix = v / 100.0
-            self.parameters_changed.emit()
-
-        layout.addWidget(_ParamRow("Drive", 10, 200, int(fx.drive * 10),
-                                   lambda v: f"{v / 10.0:.1f}", set_drive))
-        layout.addWidget(_ParamRow("Tone", 0, 100, int(fx.tone * 100),
-                                   lambda v: f"{v}%", set_tone))
-        layout.addWidget(_ParamRow("Mix", 0, 100, int(fx.mix * 100),
-                                   lambda v: f"{v}%", set_mix))
+        self._add_slider(
+            layout, "Drive", 10, 200,
+            getter=lambda: int(fx.drive * 10),
+            setter=lambda v: setattr(fx, "drive", v / 10.0),
+            formatter=lambda v: f"{v / 10.0:.1f}",
+        )
+        self._add_slider(
+            layout, "Tone", 0, 100,
+            getter=lambda: int(fx.tone * 100),
+            setter=lambda v: setattr(fx, "tone", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
+        self._add_slider(
+            layout, "Mix", 0, 100,
+            getter=lambda: int(fx.mix * 100),
+            setter=lambda v: setattr(fx, "mix", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
         return group
 
     def _build_bitcrusher(self) -> QGroupBox:
         fx = self.effects.bit_crusher
-
-        def on_toggle(checked: bool) -> None:
-            fx.enabled = bool(checked)
-            self.parameters_changed.emit()
-
-        group = self._make_group("Bit crusher", fx.enabled, on_toggle)
+        group = self._make_group(
+            "Bit crusher",
+            getter=lambda: fx.enabled,
+            setter=lambda v: setattr(fx, "enabled", v),
+        )
         layout = QVBoxLayout(group)
-
-        def set_bits(v: int) -> None:
-            fx.bit_depth = int(v)
-            self.parameters_changed.emit()
-
-        def set_rate(v: int) -> None:
-            fx.rate_reduction = int(v)
-            self.parameters_changed.emit()
-
-        def set_mix(v: int) -> None:
-            fx.mix = v / 100.0
-            self.parameters_changed.emit()
-
-        layout.addWidget(_ParamRow("Bit depth", 2, 16, int(fx.bit_depth),
-                                   lambda v: f"{v}-bit", set_bits))
-        layout.addWidget(_ParamRow("Rate reduction", 1, 32, int(fx.rate_reduction),
-                                   lambda v: f"1/{v}", set_rate))
-        layout.addWidget(_ParamRow("Mix", 0, 100, int(fx.mix * 100),
-                                   lambda v: f"{v}%", set_mix))
+        self._add_slider(
+            layout, "Bit depth", 2, 16,
+            getter=lambda: int(fx.bit_depth),
+            setter=lambda v: setattr(fx, "bit_depth", int(v)),
+            formatter=lambda v: f"{v}-bit",
+        )
+        self._add_slider(
+            layout, "Rate reduction", 1, 32,
+            getter=lambda: int(fx.rate_reduction),
+            setter=lambda v: setattr(fx, "rate_reduction", int(v)),
+            formatter=lambda v: f"1/{v}",
+        )
+        self._add_slider(
+            layout, "Mix", 0, 100,
+            getter=lambda: int(fx.mix * 100),
+            setter=lambda v: setattr(fx, "mix", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
         return group
 
     def _build_delay(self) -> QGroupBox:
         fx = self.effects.delay
-
-        def on_toggle(checked: bool) -> None:
-            fx.enabled = bool(checked)
-            self.parameters_changed.emit()
-
-        group = self._make_group("Delay", fx.enabled, on_toggle)
+        group = self._make_group(
+            "Delay",
+            getter=lambda: fx.enabled,
+            setter=lambda v: setattr(fx, "enabled", v),
+        )
         layout = QVBoxLayout(group)
-
-        def set_time(v: int) -> None:
-            fx.time_ms = float(v)
-            self.parameters_changed.emit()
-
-        def set_fb(v: int) -> None:
-            fx.feedback = v / 100.0
-            self.parameters_changed.emit()
-
-        def set_mix(v: int) -> None:
-            fx.mix = v / 100.0
-            self.parameters_changed.emit()
-
-        layout.addWidget(_ParamRow("Time", 10, 1500, int(fx.time_ms),
-                                   lambda v: f"{v} ms", set_time))
-        layout.addWidget(_ParamRow("Feedback", 0, 95, int(fx.feedback * 100),
-                                   lambda v: f"{v}%", set_fb))
-        layout.addWidget(_ParamRow("Mix", 0, 100, int(fx.mix * 100),
-                                   lambda v: f"{v}%", set_mix))
+        self._add_slider(
+            layout, "Time", 10, 1500,
+            getter=lambda: int(fx.time_ms),
+            setter=lambda v: setattr(fx, "time_ms", float(v)),
+            formatter=lambda v: f"{v} ms",
+        )
+        self._add_slider(
+            layout, "Feedback", 0, 95,
+            getter=lambda: int(fx.feedback * 100),
+            setter=lambda v: setattr(fx, "feedback", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
+        self._add_slider(
+            layout, "Mix", 0, 100,
+            getter=lambda: int(fx.mix * 100),
+            setter=lambda v: setattr(fx, "mix", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
         return group
 
     def _build_reverb(self) -> QGroupBox:
         fx = self.effects.reverb
-
-        def on_toggle(checked: bool) -> None:
-            fx.enabled = bool(checked)
-            self.parameters_changed.emit()
-
-        group = self._make_group("Reverb", fx.enabled, on_toggle)
+        group = self._make_group(
+            "Reverb",
+            getter=lambda: fx.enabled,
+            setter=lambda v: setattr(fx, "enabled", v),
+        )
         layout = QVBoxLayout(group)
-
-        def set_size(v: int) -> None:
-            fx.room_size = v / 100.0
-            self.parameters_changed.emit()
-
-        def set_damp(v: int) -> None:
-            fx.damping = v / 100.0
-            self.parameters_changed.emit()
-
-        def set_mix(v: int) -> None:
-            fx.mix = v / 100.0
-            self.parameters_changed.emit()
-
-        layout.addWidget(_ParamRow("Room size", 0, 100, int(fx.room_size * 100),
-                                   lambda v: f"{v}%", set_size))
-        layout.addWidget(_ParamRow("Damping", 0, 100, int(fx.damping * 100),
-                                   lambda v: f"{v}%", set_damp))
-        layout.addWidget(_ParamRow("Mix", 0, 100, int(fx.mix * 100),
-                                   lambda v: f"{v}%", set_mix))
+        self._add_slider(
+            layout, "Room size", 0, 100,
+            getter=lambda: int(fx.room_size * 100),
+            setter=lambda v: setattr(fx, "room_size", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
+        self._add_slider(
+            layout, "Damping", 0, 100,
+            getter=lambda: int(fx.damping * 100),
+            setter=lambda v: setattr(fx, "damping", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
+        self._add_slider(
+            layout, "Mix", 0, 100,
+            getter=lambda: int(fx.mix * 100),
+            setter=lambda v: setattr(fx, "mix", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
         return group
+
+    # ------------------------------------------------------------------
+    # Public refresh API
+    # ------------------------------------------------------------------
+
+    def refresh(self) -> None:
+        """Re-read every control from ``self.effects`` without firing changes."""
+        for slider, getter in self._sliders:
+            try:
+                slider.set_value(getter())
+            except Exception:
+                pass
+        for group, getter in self._groups:
+            try:
+                group.blockSignals(True)
+                group.setChecked(bool(getter()))
+                group.blockSignals(False)
+            except Exception:
+                group.blockSignals(False)

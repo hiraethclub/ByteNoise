@@ -1,11 +1,14 @@
 """Synthesis modes for ByteNoise.
 
-Three modes are provided in v1:
+Modes available:
     * Raw Noise - direct interpretation of bytes as audio samples.
     * Drone - bytes drive a small bank of oscillators that crossfade over
       time, producing slowly evolving tones.
     * Crunch - lo-fi raw byte interpretation with bit depth reduction and
       sample rate reduction.
+    * Space Drone (v2) - band-pass filtered noise bursts simulating shortwave
+      radio: signal fading, ionospheric drift, static textures, distant
+      sine fragments.
 
 All modes return a mono ``np.float32`` buffer in the range ``[-1.0, 1.0]``.
 
@@ -21,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+from scipy import signal
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +60,18 @@ class CrunchParams:
     bit_depth: int = 6               # 2..16 bits
     rate_reduction: int = 4          # sample-and-hold factor (>=1)
     quantisation_noise: float = 0.1  # 0..1 amount of added noise
+
+
+@dataclass
+class SpaceDroneParams:
+    """Parameters for the Space Drone synthesis mode (v2)."""
+
+    sample_rate: int = 44100
+    static_amount: float = 0.3      # 0..1 background noise floor
+    fade_speed: float = 1.0         # 0.1..5.0 how fast bands cut in/out
+    signal_clarity: float = 0.5     # 0..1 how strong the sine fragments are
+    drift_rate: float = 0.15        # Hz, slow ionospheric drift LFO
+    burst_threshold: float = 0.55   # 0..1 envelope threshold (higher = sparser)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +311,181 @@ def synth_crunch(
 
 
 # ---------------------------------------------------------------------------
+# Space Drone (v2)
+# ---------------------------------------------------------------------------
+
+
+# Fixed set of frequency bands the synth uses. Roughly logarithmic, covering
+# the AM/SW radio range plus a couple of high bands for hiss content.
+_SPACE_BANDS = (
+    (80.0, 200.0),
+    (200.0, 500.0),
+    (500.0, 1100.0),
+    (1100.0, 2400.0),
+    (2400.0, 5000.0),
+    (5000.0, 10000.0),
+)
+
+
+def synth_space_drone(
+    byte_data: np.ndarray,
+    duration_s: float,
+    params: SpaceDroneParams,
+) -> np.ndarray:
+    """Render Space Drone mode.
+
+    Recipe:
+        1. Build a deterministic noise stream from the file bytes.
+        2. Filter that noise into a fixed set of overlapping frequency bands.
+        3. Build a per-band amplitude envelope from a different slice of the
+           file - threshold it so most of the time the band is silent and
+           only "bursts" through occasionally.
+        4. Apply a slow drift LFO to the band gains to simulate ionospheric
+           propagation fades.
+        5. Add a faint static noise floor.
+        6. Sprinkle in a few sine fragments at byte-derived frequencies for
+           the "distant signal" feel.
+
+    The whole thing is driven by the file bytes - same file, same output;
+    different file, audibly different shortwave chatter.
+    """
+    sr = params.sample_rate
+    n = max(1, int(duration_s * sr))
+    nyq = 0.5 * sr
+
+    if byte_data.size == 0:
+        return np.zeros(n, dtype=np.float32)
+
+    # ----- Step 1: deterministic noise base from file bytes -----
+    base_noise = _bytes_to_float8(byte_data)
+    base_noise = _ensure_length(base_noise, n).astype(np.float32, copy=False)
+
+    # ----- Step 4 (precomputed): drift LFO at params.drift_rate Hz -----
+    t = np.arange(n, dtype=np.float32) / sr
+    drift = 0.5 + 0.5 * np.sin(2.0 * np.pi * float(params.drift_rate) * t).astype(
+        np.float32
+    )
+
+    # ----- Steps 2 + 3: per-band filtered noise * envelope -----
+    out = np.zeros(n, dtype=np.float32)
+    band_count = len(_SPACE_BANDS)
+    fade_speed = max(0.1, float(params.fade_speed))
+    threshold = float(np.clip(params.burst_threshold, 0.0, 0.95))
+
+    # Number of envelope control points across the buffer. More = faster cuts.
+    env_points = max(8, int(duration_s * 3.0 * fade_speed))
+
+    for i, (lo, hi) in enumerate(_SPACE_BANDS):
+        hi_clipped = min(hi, nyq * 0.99)
+        if hi_clipped <= lo:
+            continue
+        sos = signal.iirfilter(
+            N=4,
+            Wn=[lo / nyq, hi_clipped / nyq],
+            btype="band",
+            ftype="butter",
+            output="sos",
+        )
+        band = signal.sosfilt(sos, base_noise).astype(np.float32)
+
+        # Build the envelope from a band-specific slice of bytes so each band
+        # has its own pattern of bursts. Stride keeps adjacent bands distinct.
+        offset = (i * (byte_data.size // band_count)) % byte_data.size
+        stride = max(1, byte_data.size // (env_points * 3) + i + 1)
+        ctrl_idx = (np.arange(env_points) * stride + offset) % byte_data.size
+        ctrl = byte_data[ctrl_idx].astype(np.float32) / 255.0
+
+        # Per-band normalisation: rescale this band's control values to span
+        # 0..1 regardless of the file's overall byte distribution. Without
+        # this, files made mostly of mid-range bytes (e.g. ASCII text) would
+        # never cross the burst threshold and the band would stay silent.
+        cmin = float(ctrl.min())
+        cmax = float(ctrl.max())
+        if cmax > cmin + 1e-6:
+            ctrl = (ctrl - cmin) / (cmax - cmin)
+
+        # Stretch the control points to the buffer length with linear interp,
+        # then threshold so quiet bytes mute the band entirely (this is what
+        # gives the "burst" character).
+        env_x = np.linspace(0.0, env_points - 1.0, n).astype(np.float32)
+        env = np.interp(env_x, np.arange(env_points, dtype=np.float32), ctrl)
+        env = np.maximum(0.0, env - threshold)
+        env *= 1.0 / max(1e-3, 1.0 - threshold)
+        # Smooth the envelope a bit so bursts fade in/out instead of clicking.
+        smooth_win = max(8, int(sr * 0.02 / fade_speed))
+        if smooth_win > 1 and smooth_win < n:
+            kernel = np.ones(smooth_win, dtype=np.float32) / smooth_win
+            env = np.convolve(env, kernel, mode="same")
+
+        # Drift modulation: each band fades in/out of the drift LFO at a
+        # slightly different phase so it sounds like multiple distant stations
+        # rolling against each other.
+        phase_shift = (i * 0.27) % 1.0
+        drift_band = 0.4 + 0.6 * np.roll(drift, int(phase_shift * n))
+
+        # Per-band gain compensation: band-pass filtering loses energy, so
+        # boost each band before summing. Final peak normalisation at the end
+        # keeps the buffer in range.
+        out += band * env * drift_band * 4.0
+
+    # ----- Step 5: static noise floor -----
+    static_amount = float(np.clip(params.static_amount, 0.0, 1.0))
+    if static_amount > 0.0:
+        # High-pass the noise so the floor sits above the band content
+        # rather than rumbling underneath it.
+        sos = signal.iirfilter(
+            N=2, Wn=2000.0 / nyq, btype="high", ftype="butter", output="sos"
+        )
+        static = signal.sosfilt(sos, base_noise).astype(np.float32)
+        out += static * static_amount * 0.4
+
+    # ----- Step 6: distant sine fragments -----
+    clarity = float(np.clip(params.signal_clarity, 0.0, 1.0))
+    if clarity > 0.0:
+        n_fragments = 3
+        for k in range(n_fragments):
+            # Pick a frequency from the file bytes (one byte per fragment).
+            byte_idx = (k * (byte_data.size // n_fragments + 1)) % byte_data.size
+            freq_byte = float(byte_data[byte_idx]) / 255.0
+            freq = 200.0 + freq_byte * 1800.0  # 200 Hz .. 2 kHz
+            sine = np.sin(2.0 * np.pi * freq * t).astype(np.float32)
+
+            # Build a sparse on/off envelope from yet another slice of bytes.
+            offset = ((k + 1) * 1009) % byte_data.size
+            stride = max(1, byte_data.size // (env_points * 4) + 1)
+            ctrl_idx = (np.arange(env_points) * stride + offset) % byte_data.size
+            ctrl = byte_data[ctrl_idx].astype(np.float32) / 255.0
+            cmin = float(ctrl.min())
+            cmax = float(ctrl.max())
+            if cmax > cmin + 1e-6:
+                ctrl = (ctrl - cmin) / (cmax - cmin)
+            env_x = np.linspace(0.0, env_points - 1.0, n).astype(np.float32)
+            env = np.interp(env_x, np.arange(env_points, dtype=np.float32), ctrl)
+            # Higher threshold for fragments - they should be rarer than bands.
+            frag_thresh = 0.7
+            env = np.maximum(0.0, env - frag_thresh) * (1.0 / (1.0 - frag_thresh))
+            smooth_win = max(8, int(sr * 0.05))
+            if smooth_win > 1 and smooth_win < n:
+                kernel = np.ones(smooth_win, dtype=np.float32) / smooth_win
+                env = np.convolve(env, kernel, mode="same")
+
+            out += sine * env * clarity * 0.25
+
+    # Click guard at edges.
+    fade_len = min(2048, n // 8)
+    if fade_len > 0:
+        ramp = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+        out[:fade_len] *= ramp
+        out[-fade_len:] *= ramp[::-1]
+
+    # Soft normalise so the output sits comfortably in [-1, 1].
+    peak = float(np.max(np.abs(out))) if out.size else 0.0
+    if peak > 1.0:
+        out = out / peak
+    return out.astype(np.float32, copy=False)
+
+
+# ---------------------------------------------------------------------------
 # Top level dispatcher
 # ---------------------------------------------------------------------------
 
@@ -303,10 +494,11 @@ def synth_crunch(
 class SynthSettings:
     """Bundle of all synthesis parameters used by the engine."""
 
-    mode: str = "raw"  # raw | drone | crunch
+    mode: str = "raw"  # raw | drone | crunch | space
     raw: RawNoiseParams = field(default_factory=RawNoiseParams)
     drone: DroneParams = field(default_factory=DroneParams)
     crunch: CrunchParams = field(default_factory=CrunchParams)
+    space: SpaceDroneParams = field(default_factory=SpaceDroneParams)
     duration_s: float = 30.0
 
 
@@ -316,6 +508,8 @@ def render(byte_data: np.ndarray, settings: SynthSettings) -> np.ndarray:
         return synth_drone(byte_data, settings.duration_s, settings.drone)
     if settings.mode == "crunch":
         return synth_crunch(byte_data, settings.duration_s, settings.crunch)
+    if settings.mode == "space":
+        return synth_space_drone(byte_data, settings.duration_s, settings.space)
     return synth_raw_noise(byte_data, settings.duration_s, settings.raw)
 
 
@@ -325,4 +519,6 @@ def get_sample_rate(settings: SynthSettings) -> int:
         return settings.drone.sample_rate
     if settings.mode == "crunch":
         return settings.crunch.sample_rate
+    if settings.mode == "space":
+        return settings.space.sample_rate
     return settings.raw.sample_rate
