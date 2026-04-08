@@ -30,8 +30,15 @@ import os
 from typing import List, Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QFileSystemWatcher, QTimer
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtCore import Qt, QFileSystemWatcher, QRectF, QTimer
+from PyQt5.QtGui import (
+    QColor,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt5.QtWidgets import (
     QAction,
     QCheckBox,
@@ -683,17 +690,127 @@ class MainWindow(QMainWindow):
 
     def _on_about(self) -> None:
         from .. import __version__
-        QMessageBox.about(
-            self,
-            "About ByteNoise",
-            (
-                f"<b>ByteNoise {__version__}</b><br><br>"
-                "Convert any file's raw bytes into sound.<br><br>"
-                "Four synthesis modes, thirteen effects, "
-                "multi-file layering, presets, MIDI export, "
-                "and a file watcher for live reloads."
-            ),
+        msg = QMessageBox(self)
+        msg.setWindowTitle("About ByteNoise")
+        msg.setIconPixmap(self._make_welsh_flag(160, 100))
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(
+            f"<b>ByteNoise {__version__}</b><br><br>"
+            "Convert any file's raw bytes into sound.<br><br>"
+            "Four synthesis modes, thirteen effects, "
+            "multi-file layering, presets, MIDI export, "
+            "and a file watcher for live reloads.<br><br>"
+            "Created by Aisling de Gr&aacute;s<br>"
+            "<a href=\"mailto:aisling@hiraeth.club\">aisling@hiraeth.club</a>"
         )
+        msg.setStandardButtons(QMessageBox.Ok)
+        # Make the mailto link clickable.
+        inner_label = msg.findChild(QLabel, "qt_msgbox_label")
+        if inner_label is not None:
+            inner_label.setOpenExternalLinks(True)
+            inner_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        msg.exec_()
+
+    @staticmethod
+    def _make_welsh_flag(width: int, height: int) -> QPixmap:
+        """Draw a small Welsh flag (Y Ddraig Goch) into a QPixmap.
+
+        Top half white, bottom half green, with a stylised red dragon
+        silhouette in the middle. We don't ship a binary asset, so the
+        dragon is composed from a few painter primitives (head, body,
+        tail, legs, wing) - intentionally cartoony but recognisable
+        as a creature on the Welsh colours.
+        """
+        pix = QPixmap(width, height)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        half = height // 2
+
+        # Background stripes.
+        p.fillRect(0, 0, width, half, QColor(255, 255, 255))
+        p.fillRect(0, half, width, height - half, QColor(0, 135, 73))
+
+        # Welsh red.
+        red = QColor(206, 17, 38)
+        p.setPen(Qt.NoPen)
+        p.setBrush(red)
+
+        # Drawn in a 160x100 reference frame, scaled to the requested size.
+        ref_w, ref_h = 160.0, 100.0
+        sx = width / ref_w
+        sy = height / ref_h
+
+        def rx(v: float) -> float:
+            return v * sx
+
+        def ry(v: float) -> float:
+            return v * sy
+
+        # ----- Body: a long rounded oval running across the middle. -----
+        body = QRectF(rx(40), ry(38), rx(80), ry(28))
+        p.drawRoundedRect(body, rx(12), ry(12))
+
+        # ----- Head: ellipse on the left with a triangular snout. -----
+        head = QRectF(rx(8), ry(28), rx(40), ry(26))
+        p.drawEllipse(head)
+        snout = QPainterPath()
+        snout.moveTo(rx(0), ry(40))
+        snout.lineTo(rx(20), ry(34))
+        snout.lineTo(rx(20), ry(46))
+        snout.closeSubpath()
+        p.drawPath(snout)
+        # Tongue / fire poking out of the snout.
+        tongue = QPainterPath()
+        tongue.moveTo(rx(0), ry(40))
+        tongue.lineTo(rx(-8), ry(38))
+        tongue.lineTo(rx(-4), ry(42))
+        tongue.lineTo(rx(-8), ry(44))
+        tongue.lineTo(rx(0), ry(44))
+        tongue.closeSubpath()
+        p.drawPath(tongue)
+
+        # ----- Wing: a couple of triangular peaks above the body. -----
+        wing = QPainterPath()
+        wing.moveTo(rx(50), ry(38))
+        wing.lineTo(rx(60), ry(14))
+        wing.lineTo(rx(72), ry(22))
+        wing.lineTo(rx(82), ry(12))
+        wing.lineTo(rx(94), ry(22))
+        wing.lineTo(rx(98), ry(38))
+        wing.closeSubpath()
+        p.drawPath(wing)
+
+        # ----- Tail: curling out from the rear. -----
+        tail = QPainterPath()
+        tail.moveTo(rx(118), ry(40))
+        tail.cubicTo(rx(140), ry(30), rx(156), ry(48), rx(158), ry(72))
+        tail.lineTo(rx(150), ry(74))
+        tail.cubicTo(rx(146), ry(56), rx(132), ry(50), rx(118), ry(54))
+        tail.closeSubpath()
+        p.drawPath(tail)
+
+        # ----- Four legs hanging below the body. -----
+        leg_w = rx(6)
+        leg_h = ry(18)
+        for lx in (50, 66, 92, 108):
+            p.fillRect(QRectF(rx(lx), ry(60), leg_w, leg_h), red)
+            # Foot tip.
+            p.fillRect(QRectF(rx(lx) - rx(1), ry(60) + leg_h - ry(2), leg_w + rx(2), ry(3)), red)
+
+        # ----- Eye (white dot on the head). -----
+        eye_size = max(2, int(rx(3)))
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(int(rx(20)), int(ry(36)), eye_size, eye_size)
+
+        # ----- Border last so it stays crisp on top. -----
+        p.setPen(QPen(QColor(40, 40, 40), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(0, 0, width - 1, height - 1)
+
+        p.end()
+        return pix
 
     # ------------------------------------------------------------------
     # Lifecycle
