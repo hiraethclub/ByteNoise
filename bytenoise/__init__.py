@@ -5,4 +5,4 @@ output via three synthesis modes (Raw Noise, Drone, Crunch) and a chain of
 configurable effects.
 """
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"

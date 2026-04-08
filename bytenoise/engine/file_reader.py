@@ -15,13 +15,20 @@ import numpy as np
 
 @dataclass
 class LoadedFile:
-    """Container for a file loaded as raw bytes."""
+    """Container for a file loaded as raw bytes.
+
+    ``gain`` is used by the multi-file layering feature in the main window:
+    when several files are loaded at once, the rendered audio of each layer
+    is scaled by its gain before being summed. A single-layer load keeps it
+    at the default of 1.0.
+    """
 
     path: str
     name: str
     size: int
     data: np.ndarray  # uint8 array of raw bytes
     histogram: np.ndarray = field(default_factory=lambda: np.zeros(256, dtype=np.int64))
+    gain: float = 1.0
 
     @property
     def mean_byte(self) -> float:

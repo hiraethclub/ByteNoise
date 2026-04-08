@@ -2,31 +2,39 @@
 
 Layout:
     +---------------------------------------------------------------+
-    | [Load File] filename | [Randomise] [Undo] [Redo]              |
+    | Menu bar (File / Edit / Help)                                 |
+    +---------------------------------------------------------------+
+    | [Load file] [Add layer] [x] Watch    [Randomise] [Undo] [Redo]|
     +-----------------+-----------------------+---------------------+
-    |                 |    Waveform           |                     |
-    |  Synth panel    +-----------------------+   Effects panel     |
-    |  (left)         |    Spectrum           |   (right)           |
+    |  Layers panel   |    Waveform           |                     |
+    |                 +-----------------------+                     |
+    |  Synth panel    |    Spectrum           |   Effects panel     |
     |                 |                       |                     |
     +-----------------+-----------------------+---------------------+
     | Play  Pause  Stop   Volume [====]            [Export...]      |
     +---------------------------------------------------------------+
 
 The main window owns the synthesis settings, the effects chain, the audio
-engine, and the loaded file. It debounces parameter changes via a single
-QTimer so dragging sliders doesn't render dozens of buffers per second.
-After each render the new state is pushed onto the undo history.
+engine, and a list of loaded files (layers). Multiple layers are summed
+before the effects chain runs, so the user can mix the textures of several
+files into one patch.
+
+It also debounces parameter changes via a single QTimer so dragging sliders
+doesn't render dozens of buffers per second. After each render the new state
+is pushed onto the undo history.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QFileSystemWatcher, QTimer
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
+    QAction,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -49,9 +57,13 @@ from ..engine import synthesiser
 from ..engine.audio_engine import AudioEngine
 from ..engine.effects import EffectsChain
 from ..engine.file_reader import LoadedFile, load_file
+from ..engine.midi_export import MidiExportParams, export_midi
+from ..engine.presets import load_preset, save_preset
 from ..engine.state import HistoryManager, randomise
 from ..engine.synthesiser import SynthSettings
 from .effects_panel import EffectsPanel
+from .layers_panel import LayersPanel
+from .midi_export_dialog import MidiExportDialog
 from .spectrum import SpectrumView
 from .synth_panel import SynthPanel
 from .transport import TransportBar
@@ -68,18 +80,28 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ByteNoise")
-        self.resize(1280, 760)
+        self.resize(1320, 800)
 
         # Core state
         self.synth_settings = SynthSettings()
         self.effects_chain = EffectsChain()
         self.engine = AudioEngine()
         self.history = HistoryManager(max_entries=50)
-        self.loaded_file: Optional[LoadedFile] = None
+        self.loaded_files: List[LoadedFile] = []
         self.current_buffer: np.ndarray = np.zeros(0, dtype=np.float32)
         # When True, the next render won't push a new history entry. Used by
         # undo/redo so that applying a snapshot doesn't itself create one.
         self._suppress_history_push: bool = False
+
+        # File system watcher used by the auto re-render feature. Watches the
+        # paths of every layer; whenever any of them changes on disk we reload
+        # that layer and trigger a re-render.
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.fileChanged.connect(self._on_file_changed)
+        self._watch_enabled: bool = False
+
+        # Last-used MIDI export params, so reopening the dialog remembers them.
+        self._midi_params = MidiExportParams()
 
         self._build_ui()
         self._wire_signals()
@@ -98,6 +120,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        self._build_menu_bar()
+
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
@@ -108,16 +132,28 @@ class MainWindow(QMainWindow):
         top_bar = QWidget()
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(8, 6, 8, 6)
+
         self.load_btn = QPushButton("Load file...")
-        self.load_btn.setMinimumWidth(120)
+        self.load_btn.setMinimumWidth(110)
+        self.load_btn.setToolTip("Load a single file (replaces all layers)")
         top_layout.addWidget(self.load_btn)
+
+        self.add_layer_btn = QPushButton("Add layer...")
+        self.add_layer_btn.setToolTip("Add another file as a new layer")
+        top_layout.addWidget(self.add_layer_btn)
+
+        self.watch_check = QCheckBox("Watch")
+        self.watch_check.setToolTip(
+            "Re-render automatically when any loaded file changes on disk"
+        )
+        top_layout.addWidget(self.watch_check)
+
         self.file_info_label = QLabel("No file loaded")
         self.file_info_label.setStyleSheet("color: #cdd; padding-left: 10px;")
-        top_layout.addWidget(self.file_info_label)
-        top_layout.addStretch()
+        top_layout.addWidget(self.file_info_label, 1)
 
         self.randomise_btn = QPushButton("Randomise")
-        self.randomise_btn.setToolTip("Randomise all synth and effect parameters")
+        self.randomise_btn.setToolTip("Randomise all synth and effect parameters (Ctrl+R)")
         top_layout.addWidget(self.randomise_btn)
 
         self.undo_btn = QPushButton("Undo")
@@ -135,8 +171,16 @@ class MainWindow(QMainWindow):
         # --- Main splitter ---
         splitter = QSplitter(Qt.Horizontal)
 
+        # Left column: layers panel + synth panel.
+        left_col = QWidget()
+        left_layout = QVBoxLayout(left_col)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+        self.layers_panel = LayersPanel()
+        left_layout.addWidget(self.layers_panel)
         self.synth_panel = SynthPanel(self.synth_settings)
-        splitter.addWidget(self.synth_panel)
+        left_layout.addWidget(self.synth_panel, 1)
+        splitter.addWidget(left_col)
 
         center = QWidget()
         center_layout = QVBoxLayout(center)
@@ -152,7 +196,7 @@ class MainWindow(QMainWindow):
         self.effects_panel = EffectsPanel(self.effects_chain)
         splitter.addWidget(self.effects_panel)
 
-        splitter.setSizes([280, 640, 360])
+        splitter.setSizes([300, 620, 360])
         outer.addWidget(splitter, 1)
 
         # --- Bottom transport bar ---
@@ -161,11 +205,85 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Load a file to begin.")
 
+    def _build_menu_bar(self) -> None:
+        bar = self.menuBar()
+
+        file_menu = bar.addMenu("&File")
+
+        load_action = QAction("&Load file...", self)
+        load_action.setShortcut("Ctrl+O")
+        load_action.triggered.connect(self._on_load_clicked)
+        file_menu.addAction(load_action)
+
+        add_layer_action = QAction("&Add layer...", self)
+        add_layer_action.setShortcut("Ctrl+L")
+        add_layer_action.triggered.connect(self._on_add_layer_clicked)
+        file_menu.addAction(add_layer_action)
+
+        file_menu.addSeparator()
+
+        save_preset_action = QAction("&Save preset...", self)
+        save_preset_action.setShortcut("Ctrl+S")
+        save_preset_action.triggered.connect(self._on_save_preset)
+        file_menu.addAction(save_preset_action)
+
+        load_preset_action = QAction("Load &preset...", self)
+        load_preset_action.setShortcut("Ctrl+P")
+        load_preset_action.triggered.connect(self._on_load_preset)
+        file_menu.addAction(load_preset_action)
+
+        file_menu.addSeparator()
+
+        export_audio_action = QAction("&Export audio...", self)
+        export_audio_action.setShortcut("Ctrl+E")
+        export_audio_action.triggered.connect(self._on_export)
+        file_menu.addAction(export_audio_action)
+
+        export_midi_action = QAction("Export &MIDI...", self)
+        export_midi_action.setShortcut("Ctrl+M")
+        export_midi_action.triggered.connect(self._on_export_midi)
+        file_menu.addAction(export_midi_action)
+
+        file_menu.addSeparator()
+
+        quit_action = QAction("&Quit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        edit_menu = bar.addMenu("&Edit")
+
+        undo_action = QAction("&Undo", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self._on_undo)
+        edit_menu.addAction(undo_action)
+
+        redo_action = QAction("&Redo", self)
+        redo_action.setShortcut("Ctrl+Shift+Z")
+        redo_action.triggered.connect(self._on_redo)
+        edit_menu.addAction(redo_action)
+
+        edit_menu.addSeparator()
+
+        randomise_action = QAction("Ra&ndomise", self)
+        randomise_action.setShortcut("Ctrl+R")
+        randomise_action.triggered.connect(self._on_randomise)
+        edit_menu.addAction(randomise_action)
+
+        help_menu = bar.addMenu("&Help")
+        about_action = QAction("&About ByteNoise", self)
+        about_action.triggered.connect(self._on_about)
+        help_menu.addAction(about_action)
+
     def _wire_signals(self) -> None:
         self.load_btn.clicked.connect(self._on_load_clicked)
+        self.add_layer_btn.clicked.connect(self._on_add_layer_clicked)
+        self.watch_check.toggled.connect(self._on_watch_toggled)
         self.synth_panel.parameters_changed.connect(self._schedule_render)
         self.synth_panel.mode_changed.connect(self._on_mode_changed)
         self.effects_panel.parameters_changed.connect(self._schedule_render)
+        self.layers_panel.layer_removed.connect(self._on_layer_removed)
+        self.layers_panel.gain_changed.connect(self._schedule_render)
 
         self.randomise_btn.clicked.connect(self._on_randomise)
         self.undo_btn.clicked.connect(self._on_undo)
@@ -178,37 +296,130 @@ class MainWindow(QMainWindow):
         self.transport.volume_changed.connect(self.engine.set_volume)
         self.engine.set_volume(0.8)
 
-        # Keyboard shortcuts.
-        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self._on_undo)
-        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self._on_redo)
+        # Keyboard shortcuts not already covered by the menu bar.
         QShortcut(QKeySequence("Ctrl+Y"), self, activated=self._on_redo)
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._on_randomise)
 
     # ------------------------------------------------------------------
     # File loading
     # ------------------------------------------------------------------
 
-    def _on_load_clicked(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open any file",
-            "",
-            "All files (*)",
-        )
-        if not path:
-            return
+    def _pick_file(self, title: str) -> Optional[str]:
+        path, _ = QFileDialog.getOpenFileName(self, title, "", "All files (*)")
+        return path or None
+
+    def _try_load(self, path: str) -> Optional[LoadedFile]:
         try:
             loaded = load_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", f"Could not load file:\n{exc}")
-            return
+            return None
         if loaded.size == 0:
             QMessageBox.warning(self, "Empty file", "That file has no bytes to play.")
-            return
+            return None
+        return loaded
 
-        self.loaded_file = loaded
-        self.file_info_label.setText(loaded.info_string())
+    def _on_load_clicked(self) -> None:
+        path = self._pick_file("Open any file")
+        if not path:
+            return
+        loaded = self._try_load(path)
+        if loaded is None:
+            return
+        # Replace all existing layers with this one file.
+        self._set_layers([loaded])
         self.statusBar().showMessage(f"Loaded {loaded.name}")
+        self._render_now()
+
+    def _on_add_layer_clicked(self) -> None:
+        path = self._pick_file("Add file as a new layer")
+        if not path:
+            return
+        loaded = self._try_load(path)
+        if loaded is None:
+            return
+        self._set_layers(self.loaded_files + [loaded])
+        self.statusBar().showMessage(f"Added layer {loaded.name}")
+        self._render_now()
+
+    def _on_layer_removed(self, index: int) -> None:
+        if not (0 <= index < len(self.loaded_files)):
+            return
+        new_layers = list(self.loaded_files)
+        removed = new_layers.pop(index)
+        self._set_layers(new_layers)
+        self.statusBar().showMessage(f"Removed layer {removed.name}")
+        self._render_now()
+
+    def _set_layers(self, layers: List[LoadedFile]) -> None:
+        """Update the layer list, the panel, the file watcher, and the label."""
+        self.loaded_files = list(layers)
+        self.layers_panel.set_layers(self.loaded_files)
+        self._refresh_file_info_label()
+        self._refresh_watcher_paths()
+
+    def _refresh_file_info_label(self) -> None:
+        if not self.loaded_files:
+            self.file_info_label.setText("No file loaded")
+        elif len(self.loaded_files) == 1:
+            self.file_info_label.setText(self.loaded_files[0].info_string())
+        else:
+            total = sum(f.size for f in self.loaded_files)
+            self.file_info_label.setText(
+                f"{len(self.loaded_files)} layers  |  {_format_total_size(total)}"
+            )
+
+    # ------------------------------------------------------------------
+    # File watcher
+    # ------------------------------------------------------------------
+
+    def _on_watch_toggled(self, checked: bool) -> None:
+        self._watch_enabled = bool(checked)
+        self._refresh_watcher_paths()
+        if self._watch_enabled:
+            self.statusBar().showMessage("Auto re-render on file change: ON")
+        else:
+            self.statusBar().showMessage("Auto re-render on file change: OFF")
+
+    def _refresh_watcher_paths(self) -> None:
+        """Sync the QFileSystemWatcher's watched-paths list with the layers."""
+        currently_watched = list(self._fs_watcher.files())
+        if currently_watched:
+            self._fs_watcher.removePaths(currently_watched)
+        if not self._watch_enabled:
+            return
+        paths = [f.path for f in self.loaded_files if f.path and os.path.isfile(f.path)]
+        if paths:
+            self._fs_watcher.addPaths(paths)
+
+    def _on_file_changed(self, path: str) -> None:
+        # Some editors replace the file atomically (delete + create); QFSW
+        # stops watching it when that happens, so re-add it after a short
+        # delay before doing the reload.
+        QTimer.singleShot(80, lambda: self._reload_layer(path))
+
+    def _reload_layer(self, path: str) -> None:
+        # Re-add the path to the watcher in case it was unhooked.
+        if self._watch_enabled and os.path.isfile(path) and path not in self._fs_watcher.files():
+            self._fs_watcher.addPath(path)
+
+        for i, layer in enumerate(self.loaded_files):
+            if layer.path != path:
+                continue
+            try:
+                fresh = load_file(path)
+            except Exception as exc:
+                self.statusBar().showMessage(f"Watch reload failed: {exc}")
+                return
+            if fresh.size == 0:
+                self.statusBar().showMessage(f"Watched file is empty: {os.path.basename(path)}")
+                return
+            # Preserve the user's gain setting on the layer.
+            fresh.gain = layer.gain
+            self.loaded_files[i] = fresh
+
+        self.layers_panel.set_layers(self.loaded_files)
+        self._refresh_file_info_label()
+        self.statusBar().showMessage(f"Reloaded {os.path.basename(path)}")
         self._render_now()
 
     # ------------------------------------------------------------------
@@ -223,12 +434,33 @@ class MainWindow(QMainWindow):
         self._render_timer.start(RENDER_DEBOUNCE_MS)
 
     def _render_now(self) -> None:
-        if self.loaded_file is None or self.loaded_file.size == 0:
+        if not self.loaded_files:
             return
         try:
-            raw = synthesiser.render(self.loaded_file.data, self.synth_settings)
             sample_rate = synthesiser.get_sample_rate(self.synth_settings)
-            processed = self.effects_chain.process(raw, sample_rate)
+            # Render every layer through the synth and sum them, weighted by
+            # each layer's per-file gain. Effects then run on the combined mix
+            # so layers share the same texture.
+            buffers: List[np.ndarray] = []
+            total_gain = 0.0
+            for layer in self.loaded_files:
+                if layer.size == 0:
+                    continue
+                raw = synthesiser.render(layer.data, self.synth_settings)
+                buffers.append(raw * float(layer.gain))
+                total_gain += float(layer.gain)
+            if not buffers:
+                return
+            mixed = buffers[0]
+            for b in buffers[1:]:
+                mixed = mixed + b
+            # Average so adding layers doesn't cause runaway clipping; the
+            # per-layer gain still controls relative loudness.
+            denom = max(1.0, float(len(buffers)))
+            mixed = (mixed / denom).astype(np.float32)
+
+            processed = self.effects_chain.process(mixed, sample_rate)
+
             # Soft normalise so loud effects don't clip the speakers.
             peak = float(np.max(np.abs(processed))) if processed.size else 0.0
             if peak > 1.0:
@@ -287,6 +519,43 @@ class MainWindow(QMainWindow):
         self.redo_btn.setEnabled(self.history.can_redo())
 
     # ------------------------------------------------------------------
+    # Presets
+    # ------------------------------------------------------------------
+
+    def _on_save_preset(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save preset", "bytenoise_preset.json",
+            "ByteNoise preset (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            save_preset(path, self.synth_settings, self.effects_chain)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", f"Could not save preset:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Saved preset to {os.path.basename(path)}")
+
+    def _on_load_preset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load preset", "",
+            "ByteNoise preset (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            load_preset(path, self.synth_settings, self.effects_chain)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load failed", f"Could not load preset:\n{exc}")
+            return
+        self.synth_panel.refresh()
+        self.effects_panel.refresh()
+        self.statusBar().showMessage(f"Loaded preset {os.path.basename(path)}")
+        self._render_now()
+
+    # ------------------------------------------------------------------
     # Transport
     # ------------------------------------------------------------------
 
@@ -306,7 +575,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Stopped")
 
     # ------------------------------------------------------------------
-    # Export
+    # Export (audio)
     # ------------------------------------------------------------------
 
     def _on_export(self) -> None:
@@ -319,10 +588,7 @@ class MainWindow(QMainWindow):
                                  "soundfile is not installed - cannot export.")
             return
 
-        default_name = "bytenoise.wav"
-        if self.loaded_file is not None:
-            stem = self.loaded_file.name.rsplit(".", 1)[0] or "bytenoise"
-            default_name = f"{stem}_bytenoise.wav"
+        default_name = self._default_export_stem() + ".wav"
 
         # Offer both WAV and FLAC. The selected filter determines the format
         # we pass to soundfile, with the file extension as a fallback.
@@ -366,6 +632,70 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Exported to {path}")
 
     # ------------------------------------------------------------------
+    # Export (MIDI)
+    # ------------------------------------------------------------------
+
+    def _on_export_midi(self) -> None:
+        if not self.loaded_files:
+            QMessageBox.information(self, "Nothing to export",
+                                    "Load a file first.")
+            return
+
+        dialog = MidiExportDialog(self, defaults=self._midi_params)
+        if dialog.exec_() != dialog.Accepted:
+            return
+        params = dialog.params()
+        self._midi_params = params
+
+        default_name = self._default_export_stem() + ".mid"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export MIDI", default_name,
+            "MIDI files (*.mid);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".mid"):
+            path += ".mid"
+
+        # MIDI is built from the first layer's bytes - layering is an audio
+        # concept and doesn't translate cleanly to a single MIDI track.
+        primary = self.loaded_files[0]
+        try:
+            n_notes = export_midi(path, primary.data, params)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed",
+                                 f"Could not write MIDI:\n{exc}")
+            return
+        self.statusBar().showMessage(
+            f"Exported MIDI to {os.path.basename(path)} ({n_notes} notes)"
+        )
+
+    def _default_export_stem(self) -> str:
+        if not self.loaded_files:
+            return "bytenoise"
+        primary = self.loaded_files[0]
+        stem = primary.name.rsplit(".", 1)[0] or "bytenoise"
+        return f"{stem}_bytenoise"
+
+    # ------------------------------------------------------------------
+    # Help
+    # ------------------------------------------------------------------
+
+    def _on_about(self) -> None:
+        from .. import __version__
+        QMessageBox.about(
+            self,
+            "About ByteNoise",
+            (
+                f"<b>ByteNoise {__version__}</b><br><br>"
+                "Convert any file's raw bytes into sound.<br><br>"
+                "Four synthesis modes, thirteen effects, "
+                "multi-file layering, presets, MIDI export, "
+                "and a file watcher for live reloads."
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -374,3 +704,12 @@ class MainWindow(QMainWindow):
             self.engine.shutdown()
         finally:
             super().closeEvent(event)
+
+
+def _format_total_size(size: int) -> str:
+    val = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0:
+            return f"{val:.0f} {unit}" if unit == "B" else f"{val:.1f} {unit}"
+        val /= 1024.0
+    return f"{val:.1f} PB"
