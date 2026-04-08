@@ -237,6 +237,7 @@ class MainWindow(QMainWindow):
             self.engine.set_buffer(processed, sample_rate)
             self.waveform.set_buffer(processed)
             self.spectrum.set_buffer(processed, sample_rate)
+            self.effects_panel.update_meters()
         except Exception as exc:  # pragma: no cover - render errors should not crash GUI
             self.statusBar().showMessage(f"Render error: {exc}")
             return

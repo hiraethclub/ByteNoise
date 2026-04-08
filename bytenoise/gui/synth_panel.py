@@ -120,7 +120,7 @@ class SynthPanel(QWidget):
         self._add_slider(
             duration_layout,
             "Buffer length",
-            2, 120,
+            2, 600,
             getter=lambda: int(self.settings.duration_s),
             setter=lambda v: setattr(self.settings, "duration_s", float(v)),
             formatter=lambda v: f"{v} s",

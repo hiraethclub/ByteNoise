@@ -58,7 +58,18 @@ def randomise(settings: SynthSettings, chain: EffectsChain) -> None:
     space.drift_rate = rng.uniform(0.05, 0.8)
     space.burst_threshold = rng.uniform(0.3, 0.75)
 
-    # --- Effects: each has a 50% chance of being enabled with random params ---
+    # --- Effects: each has a chance of being enabled with random params ---
+    eq = chain.eq
+    eq.enabled = rng.random() < 0.4
+    eq.low_freq = rng.uniform(60.0, 350.0)
+    eq.low_gain = rng.uniform(-9.0, 9.0)
+    eq.mid_freq = rng.uniform(400.0, 3500.0)
+    eq.mid_gain = rng.uniform(-9.0, 9.0)
+    eq.high_freq = rng.uniform(3500.0, 12000.0)
+    eq.high_gain = rng.uniform(-9.0, 9.0)
+    eq.q = rng.uniform(0.5, 1.8)
+    eq.mix = 1.0
+
     lp = chain.low_pass
     lp.enabled = rng.random() < 0.5
     lp.cutoff = rng.uniform(300.0, 12000.0)
@@ -71,11 +82,51 @@ def randomise(settings: SynthSettings, chain: EffectsChain) -> None:
     hp.resonance = rng.uniform(0.5, 2.5)
     hp.mix = rng.uniform(0.5, 1.0)
 
+    rm = chain.ring_mod
+    rm.enabled = rng.random() < 0.25
+    rm.carrier_freq = rng.uniform(30.0, 1200.0)
+    rm.mix = rng.uniform(0.3, 0.7)
+
     dist = chain.distortion
     dist.enabled = rng.random() < 0.5
     dist.drive = rng.uniform(1.5, 12.0)
     dist.tone = rng.uniform(0.0, 1.0)
     dist.mix = rng.uniform(0.3, 0.9)
+
+    chorus = chain.chorus
+    chorus.enabled = rng.random() < 0.35
+    chorus.rate = rng.uniform(0.1, 2.5)
+    chorus.depth = rng.uniform(0.001, 0.012)
+    chorus.delay = rng.uniform(0.005, 0.04)
+    chorus.mix = rng.uniform(0.3, 0.7)
+
+    flanger = chain.flanger
+    flanger.enabled = rng.random() < 0.3
+    flanger.rate = rng.uniform(0.1, 1.5)
+    flanger.depth = rng.uniform(0.001, 0.006)
+    flanger.delay = rng.uniform(0.001, 0.008)
+    flanger.feedback = rng.uniform(0.0, 0.7)
+    flanger.mix = rng.uniform(0.3, 0.7)
+
+    phaser = chain.phaser
+    phaser.enabled = rng.random() < 0.3
+    phaser.rate = rng.uniform(0.1, 1.5)
+    phaser.depth = rng.uniform(0.4, 0.95)
+    phaser.stages = rng.choice([2, 4, 4, 6])
+    phaser.mix = rng.uniform(0.3, 0.7)
+
+    gran = chain.granular
+    gran.enabled = rng.random() < 0.25
+    gran.grain_ms = rng.uniform(20.0, 250.0)
+    gran.density = rng.uniform(0.8, 3.0)
+    gran.scatter = rng.uniform(0.0, 0.8)
+    gran.mix = rng.uniform(0.4, 0.8)
+
+    paul = chain.paulstretch
+    paul.enabled = rng.random() < 0.2
+    paul.stretch = rng.uniform(2.0, 10.0)
+    paul.window_ms = rng.uniform(120.0, 500.0)
+    paul.mix = rng.uniform(0.4, 0.8)
 
     bc = chain.bit_crusher
     bc.enabled = rng.random() < 0.4
