@@ -282,6 +282,20 @@ class SynthPanel(QWidget):
         layout = QVBoxLayout(widget)
 
         self._add_slider(
+            layout, "Slowness", 0, 100,
+            getter=lambda: int(self.settings.space.slowness * 100),
+            setter=lambda v: setattr(self.settings.space, "slowness", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
+
+        self._add_slider(
+            layout, "Warmth", 0, 100,
+            getter=lambda: int(self.settings.space.warmth * 100),
+            setter=lambda v: setattr(self.settings.space, "warmth", v / 100.0),
+            formatter=lambda v: f"{v}%",
+        )
+
+        self._add_slider(
             layout, "Static amount", 0, 100,
             getter=lambda: int(self.settings.space.static_amount * 100),
             setter=lambda v: setattr(self.settings.space, "static_amount", v / 100.0),

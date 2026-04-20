@@ -72,6 +72,8 @@ class SpaceDroneParams:
     signal_clarity: float = 0.5     # 0..1 how strong the sine fragments are
     drift_rate: float = 0.15        # Hz, slow ionospheric drift LFO
     burst_threshold: float = 0.55   # 0..1 envelope threshold (higher = sparser)
+    slowness: float = 0.5           # 0..1, higher = more glacial evolution
+    warmth: float = 0.5            # 0..1, higher = consonant harmonics over noise
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +329,9 @@ _SPACE_BANDS = (
 )
 
 
+_CONSONANT_RATIOS = [1.0, 5.0/4, 4.0/3, 3.0/2, 5.0/3, 2.0, 5.0/2, 3.0]
+
+
 def synth_space_drone(
     byte_data: np.ndarray,
     duration_s: float,
@@ -356,24 +361,28 @@ def synth_space_drone(
     if byte_data.size == 0:
         return np.zeros(n, dtype=np.float32)
 
+    slowness = float(np.clip(params.slowness, 0.0, 1.0))
+    warmth = float(np.clip(params.warmth, 0.0, 1.0))
+    slow_factor = max(0.05, 1.0 - slowness * 0.95)
+
     # ----- Step 1: deterministic noise base from file bytes -----
     base_noise = _bytes_to_float8(byte_data)
     base_noise = _ensure_length(base_noise, n).astype(np.float32, copy=False)
 
     # ----- Step 4 (precomputed): drift LFO at params.drift_rate Hz -----
     t = np.arange(n, dtype=np.float32) / sr
-    drift = 0.5 + 0.5 * np.sin(2.0 * np.pi * float(params.drift_rate) * t).astype(
+    effective_drift = float(params.drift_rate) * slow_factor
+    drift = 0.5 + 0.5 * np.sin(2.0 * np.pi * effective_drift * t).astype(
         np.float32
     )
 
     # ----- Steps 2 + 3: per-band filtered noise * envelope -----
     out = np.zeros(n, dtype=np.float32)
     band_count = len(_SPACE_BANDS)
-    fade_speed = max(0.1, float(params.fade_speed))
+    fade_speed = max(0.05, float(params.fade_speed) * slow_factor)
     threshold = float(np.clip(params.burst_threshold, 0.0, 0.95))
 
-    # Number of envelope control points across the buffer. More = faster cuts.
-    env_points = max(8, int(duration_s * 3.0 * fade_speed))
+    env_points = max(4, int(duration_s * 3.0 * fade_speed))
 
     for i, (lo, hi) in enumerate(_SPACE_BANDS):
         hi_clipped = min(hi, nyq * 0.99)
@@ -411,8 +420,7 @@ def synth_space_drone(
         env = np.interp(env_x, np.arange(env_points, dtype=np.float32), ctrl)
         env = np.maximum(0.0, env - threshold)
         env *= 1.0 / max(1e-3, 1.0 - threshold)
-        # Smooth the envelope a bit so bursts fade in/out instead of clicking.
-        smooth_win = max(8, int(sr * 0.02 / fade_speed))
+        smooth_win = max(8, int(sr * 0.02 / fade_speed * (1.0 + slowness * 4.0)))
         if smooth_win > 1 and smooth_win < n:
             kernel = np.ones(smooth_win, dtype=np.float32) / smooth_win
             env = np.convolve(env, kernel, mode="same")
@@ -429,7 +437,7 @@ def synth_space_drone(
         out += band * env * drift_band * 4.0
 
     # ----- Step 5: static noise floor -----
-    static_amount = float(np.clip(params.static_amount, 0.0, 1.0))
+    static_amount = float(np.clip(params.static_amount, 0.0, 1.0)) * max(0.1, 1.0 - warmth * 0.7)
     if static_amount > 0.0:
         # High-pass the noise so the floor sits above the band content
         # rather than rumbling underneath it.
@@ -439,18 +447,25 @@ def synth_space_drone(
         static = signal.sosfilt(sos, base_noise).astype(np.float32)
         out += static * static_amount * 0.4
 
-    # ----- Step 6: distant sine fragments -----
+    # ----- Step 6: sine fragments (harmonic when warmth is high) -----
     clarity = float(np.clip(params.signal_clarity, 0.0, 1.0))
     if clarity > 0.0:
-        n_fragments = 3
+        n_fragments = 3 + int(warmth * 5)
+        root_byte = float(byte_data[0]) / 255.0
+        root_freq = 100.0 + root_byte * 300.0
+
         for k in range(n_fragments):
-            # Pick a frequency from the file bytes (one byte per fragment).
             byte_idx = (k * (byte_data.size // n_fragments + 1)) % byte_data.size
             freq_byte = float(byte_data[byte_idx]) / 255.0
-            freq = 200.0 + freq_byte * 1800.0  # 200 Hz .. 2 kHz
+            random_freq = 200.0 + freq_byte * 1800.0
+            harmonic_freq = root_freq * _CONSONANT_RATIOS[k % len(_CONSONANT_RATIOS)]
+            while harmonic_freq > 2000.0:
+                harmonic_freq *= 0.5
+            while harmonic_freq < 100.0:
+                harmonic_freq *= 2.0
+            freq = random_freq * (1.0 - warmth) + harmonic_freq * warmth
             sine = np.sin(2.0 * np.pi * freq * t).astype(np.float32)
 
-            # Build a sparse on/off envelope from yet another slice of bytes.
             offset = ((k + 1) * 1009) % byte_data.size
             stride = max(1, byte_data.size // (env_points * 4) + 1)
             ctrl_idx = (np.arange(env_points) * stride + offset) % byte_data.size
@@ -461,15 +476,14 @@ def synth_space_drone(
                 ctrl = (ctrl - cmin) / (cmax - cmin)
             env_x = np.linspace(0.0, env_points - 1.0, n).astype(np.float32)
             env = np.interp(env_x, np.arange(env_points, dtype=np.float32), ctrl)
-            # Higher threshold for fragments - they should be rarer than bands.
-            frag_thresh = 0.7
+            frag_thresh = max(0.3, 0.7 - warmth * 0.4)
             env = np.maximum(0.0, env - frag_thresh) * (1.0 / (1.0 - frag_thresh))
-            smooth_win = max(8, int(sr * 0.05))
-            if smooth_win > 1 and smooth_win < n:
-                kernel = np.ones(smooth_win, dtype=np.float32) / smooth_win
+            frag_smooth = max(8, int(sr * 0.05 * (1.0 + slowness * 3.0)))
+            if frag_smooth > 1 and frag_smooth < n:
+                kernel = np.ones(frag_smooth, dtype=np.float32) / frag_smooth
                 env = np.convolve(env, kernel, mode="same")
 
-            out += sine * env * clarity * 0.25
+            out += sine * env * clarity * (0.25 + warmth * 0.35)
 
     # Click guard at edges.
     fade_len = min(2048, n // 8)

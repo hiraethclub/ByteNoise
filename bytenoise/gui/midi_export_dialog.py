@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -90,6 +91,18 @@ class MidiExportDialog(QDialog):
         self.max_notes.setValue(self._params.max_notes)
         form.addRow("Max notes", self.max_notes)
 
+        self.multi_track = QCheckBox("Multi-instrument arrangement")
+        self.multi_track.setChecked(self._params.multi_track)
+        form.addRow("", self.multi_track)
+
+        self.track_count = QSpinBox()
+        self.track_count.setRange(2, 6)
+        self.track_count.setValue(self._params.track_count)
+        form.addRow("Tracks", self.track_count)
+
+        self.multi_track.toggled.connect(self.track_count.setEnabled)
+        self.track_count.setEnabled(self._params.multi_track)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -107,4 +120,6 @@ class MidiExportDialog(QDialog):
             velocity_min=self.vmin.value(),
             velocity_max=max(self.vmin.value(), self.vmax.value()),
             max_notes=self.max_notes.value(),
+            multi_track=self.multi_track.isChecked(),
+            track_count=self.track_count.value(),
         )

@@ -19,6 +19,7 @@ No external dependencies - just bytes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -62,6 +63,8 @@ class MidiExportParams:
     velocity_min: int = 50
     velocity_max: int = 115
     max_notes: int = 4096             # cap so huge files don't make huge MIDIs
+    multi_track: bool = True
+    track_count: int = 4              # 2..6 instrument tracks
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +203,177 @@ def _build_smf(track: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Multi-track (format 1) support
+# ---------------------------------------------------------------------------
+
+
+_AMBIENT_PALETTE = [
+    {"program": 88, "role": "pad", "note_mult": 4.0, "vel_scale": 0.7, "oct": 0},
+    {"program": 48, "role": "melody", "note_mult": 1.0, "vel_scale": 0.85, "oct": 0},
+    {"program": 52, "role": "chord", "note_mult": 2.0, "vel_scale": 0.6, "oct": 0},
+    {"program": 11, "role": "arp", "note_mult": 0.25, "vel_scale": 0.5, "oct": 1},
+    {"program": 99, "role": "drone", "note_mult": 8.0, "vel_scale": 0.5, "oct": -1},
+    {"program": 89, "role": "pad", "note_mult": 6.0, "vel_scale": 0.55, "oct": -1},
+]
+
+
+def _build_pitches(params: MidiExportParams, octave_shift: int = 0) -> List[int]:
+    """Build the available pitch list with an optional octave shift."""
+    scale_offsets = SCALES.get(params.scale, SCALES["pentatonic_minor"])
+    octaves = max(1, int(params.octaves))
+    base_midi = max(0, min(108, 12 * (int(params.base_octave) + octave_shift + 1)))
+    pitches: List[int] = []
+    for oct_i in range(octaves):
+        for off in scale_offsets:
+            note = base_midi + 12 * oct_i + off
+            if 0 <= note <= 127:
+                pitches.append(note)
+    return pitches or [60]
+
+
+def _make_triad(pitch: int, pitches: List[int]) -> List[int]:
+    """Return a scale-degree triad [root, 3rd, 5th] from the pitch list."""
+    try:
+        idx = pitches.index(pitch)
+    except ValueError:
+        return [pitch]
+    chord = [pitch]
+    if idx + 2 < len(pitches):
+        chord.append(pitches[idx + 2])
+    if idx + 4 < len(pitches):
+        chord.append(pitches[idx + 4])
+    return chord
+
+
+def _build_conductor_track(params: MidiExportParams) -> bytes:
+    """Track 0: tempo meta event only."""
+    events = bytearray()
+    bpm = max(20, min(300, int(params.tempo_bpm)))
+    us_per_qn = int(round(60_000_000 / bpm))
+    events += _vlq(0)
+    events += b"\xFF\x51\x03"
+    events += us_per_qn.to_bytes(3, "big")
+    events += _vlq(0)
+    events += b"\xFF\x2F\x00"
+    return bytes(events)
+
+
+def _build_instrument_track(
+    notes: List[Tuple[int, int]],
+    params: MidiExportParams,
+    channel: int,
+    program: int,
+    role: str,
+    note_mult: float,
+    vel_scale: float,
+    pitches: List[int],
+) -> bytes:
+    """Build one instrument track with role-specific note patterns."""
+    ppq = 480
+    base_ticks = max(1, int(round(ppq * float(params.note_length_beats))))
+    note_ticks = max(1, int(round(base_ticks * note_mult)))
+
+    events = bytearray()
+
+    events += _vlq(0)
+    events += bytes([0xC0 | (channel & 0x0F), program & 0x7F])
+
+    note_on = 0x90 | (channel & 0x0F)
+    note_off = 0x80 | (channel & 0x0F)
+
+    breathing_period = max(8, len(notes) // 3) if notes else 16
+
+    for i, (pitch, vel) in enumerate(notes):
+        breath = 0.7 + 0.3 * math.sin(2.0 * math.pi * i / breathing_period)
+        v = max(1, min(127, int(vel * vel_scale * breath)))
+
+        if role == "chord":
+            triad = _make_triad(pitch, pitches)
+            for j, p in enumerate(triad):
+                chord_vel = max(1, min(127, v - j * 5))
+                events += _vlq(0)
+                events += bytes([note_on, p & 0x7F, chord_vel & 0x7F])
+            for j, p in enumerate(triad):
+                events += _vlq(note_ticks if j == 0 else 0)
+                events += bytes([note_off, p & 0x7F, 0x40])
+
+        elif role == "arp":
+            triad = _make_triad(pitch, pitches)
+            arp_ticks = max(1, note_ticks // max(1, len(triad)))
+            for p in triad:
+                events += _vlq(0)
+                events += bytes([note_on, p & 0x7F, v & 0x7F])
+                events += _vlq(arp_ticks)
+                events += bytes([note_off, p & 0x7F, 0x40])
+
+        else:
+            events += _vlq(0)
+            events += bytes([note_on, pitch & 0x7F, v & 0x7F])
+            events += _vlq(note_ticks)
+            events += bytes([note_off, pitch & 0x7F, 0x40])
+
+    events += _vlq(0)
+    events += b"\xFF\x2F\x00"
+    return bytes(events)
+
+
+def _build_smf_multi(tracks: List[bytes]) -> bytes:
+    """Wrap multiple tracks in MThd + MTrk chunks (format 1)."""
+    ppq = 480
+    n_tracks = len(tracks)
+    header = b"MThd" + (6).to_bytes(4, "big")
+    header += (1).to_bytes(2, "big")
+    header += n_tracks.to_bytes(2, "big")
+    header += ppq.to_bytes(2, "big")
+    result = header
+    for track_data in tracks:
+        result += b"MTrk" + len(track_data).to_bytes(4, "big") + track_data
+    return result
+
+
+def _export_multi(
+    path: str,
+    byte_data: np.ndarray,
+    params: MidiExportParams,
+) -> int:
+    """Build and write a multi-track MIDI file."""
+    track_count = max(2, min(6, int(params.track_count)))
+    palette = _AMBIENT_PALETTE[:track_count]
+    chunk_size = max(1, byte_data.size // track_count)
+
+    all_tracks: List[bytes] = [_build_conductor_track(params)]
+    total_notes = 0
+
+    for t_idx, info in enumerate(palette):
+        start = t_idx * chunk_size
+        end = start + chunk_size if t_idx < track_count - 1 else byte_data.size
+        segment = byte_data[start:end]
+        if segment.size == 0:
+            continue
+
+        pitches = _build_pitches(params, info["oct"])
+        notes = _bytes_to_notes(segment, params)
+
+        if info["role"] == "drone":
+            notes = notes[::4]
+
+        channel = t_idx if t_idx < 9 else t_idx + 1
+        track = _build_instrument_track(
+            notes, params, channel,
+            info["program"], info["role"],
+            info["note_mult"], info["vel_scale"],
+            pitches,
+        )
+        all_tracks.append(track)
+        total_notes += len(notes)
+
+    smf = _build_smf_multi(all_tracks)
+    with open(path, "wb") as fh:
+        fh.write(smf)
+    return total_notes
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -213,6 +387,9 @@ def export_midi(
 
     Returns the number of notes written.
     """
+    if params.multi_track:
+        return _export_multi(path, byte_data, params)
+
     notes = _bytes_to_notes(byte_data, params)
     track = _build_track(notes, params)
     smf = _build_smf(track)
